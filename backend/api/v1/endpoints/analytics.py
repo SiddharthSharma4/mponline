@@ -23,7 +23,12 @@ def get_analytics_dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
     status_counts = {status: count for status, count in evaluations}
     
     scripts_evaluated = sum(count for status, count in status_counts.items() if status in ["EVALUATED", "VERIFIED", "REVIEW_REQUIRED", "MODERATED", "RESULT_READY"])
-    pending = status_counts.get("PENDING", 0) # Assuming some start in PENDING
+    # Evaluations are created with status "IN_PROGRESS" (see
+    # evaluation.py::_get_or_create_session_evaluation) and never "PENDING" --
+    # that status is never written anywhere, so this was always 0 regardless
+    # of real data. A script that exists but hasn't been evaluated yet is the
+    # honest definition of "pending".
+    pending = max(total_scripts - scripts_evaluated, 0)
     verified = status_counts.get("VERIFIED", 0)
     moderated = status_counts.get("MODERATED", 0)
     result_ready = status_counts.get("RESULT_READY", 0)
@@ -33,9 +38,15 @@ def get_analytics_dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
     avg_eval_time = db.query(func.avg(Evaluation.evaluation_time_mins)).scalar() or 0.0
     review_signals_count = db.query(func.count(ReviewSignal.id)).scalar()
     
-    # Anomaly stats
-    total_signals = db.query(func.count(ReviewSignal.id)).scalar() or 1 # avoid div zero
-    q04_signals = db.query(func.count(ReviewSignal.id)).filter(ReviewSignal.reason.ilike("%total%")).scalar()
+    # Anomaly stats. NOTE: despite the field name (kept as-is below for
+    # frontend compatibility -- src/stages/analytics.js reads
+    # dash.anomalies.q04_discrepancy_rate), this counts ALL TOTAL_MISMATCH
+    # review signals, not specifically Q04. Matching on the "TOTAL_MISMATCH:"
+    # reason prefix (set in verification.py) instead of the old "%total%"
+    # substring, since that also happened to match the word "total" inside
+    # every TOTAL_MISMATCH message body -- correct by coincidence, not design.
+    total_signals = db.query(func.count(ReviewSignal.id)).scalar() or 1  # avoid div-by-zero
+    q04_signals = db.query(func.count(ReviewSignal.id)).filter(ReviewSignal.reason.ilike("TOTAL_MISMATCH:%")).scalar()
     
     return {
         "assessment": {

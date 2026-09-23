@@ -1,0 +1,356 @@
+diff --git a/backend/api/v1/endpoints/analytics.py b/backend/api/v1/endpoints/analytics.py
+index 86dab21..c1aa12d 100644
+--- a/backend/api/v1/endpoints/analytics.py
++++ b/backend/api/v1/endpoints/analytics.py
+@@ -23,7 +23,12 @@ def get_analytics_dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
+     status_counts = {status: count for status, count in evaluations}
+     
+     scripts_evaluated = sum(count for status, count in status_counts.items() if status in ["EVALUATED", "VERIFIED", "REVIEW_REQUIRED", "MODERATED", "RESULT_READY"])
+-    pending = status_counts.get("PENDING", 0) # Assuming some start in PENDING
++    # Evaluations are created with status "IN_PROGRESS" (see
++    # evaluation.py::_get_or_create_session_evaluation) and never "PENDING" --
++    # that status is never written anywhere, so this was always 0 regardless
++    # of real data. A script that exists but hasn't been evaluated yet is the
++    # honest definition of "pending".
++    pending = max(total_scripts - scripts_evaluated, 0)
+     verified = status_counts.get("VERIFIED", 0)
+     moderated = status_counts.get("MODERATED", 0)
+     result_ready = status_counts.get("RESULT_READY", 0)
+@@ -33,9 +38,15 @@ def get_analytics_dashboard(db: Session = Depends(get_db)) -> Dict[str, Any]:
+     avg_eval_time = db.query(func.avg(Evaluation.evaluation_time_mins)).scalar() or 0.0
+     review_signals_count = db.query(func.count(ReviewSignal.id)).scalar()
+     
+-    # Anomaly stats
+-    total_signals = db.query(func.count(ReviewSignal.id)).scalar() or 1 # avoid div zero
+-    q04_signals = db.query(func.count(ReviewSignal.id)).filter(ReviewSignal.reason.ilike("%total%")).scalar()
++    # Anomaly stats. NOTE: despite the field name (kept as-is below for
++    # frontend compatibility -- src/stages/analytics.js reads
++    # dash.anomalies.q04_discrepancy_rate), this counts ALL TOTAL_MISMATCH
++    # review signals, not specifically Q04. Matching on the "TOTAL_MISMATCH:"
++    # reason prefix (set in verification.py) instead of the old "%total%"
++    # substring, since that also happened to match the word "total" inside
++    # every TOTAL_MISMATCH message body -- correct by coincidence, not design.
++    total_signals = db.query(func.count(ReviewSignal.id)).scalar() or 1  # avoid div-by-zero
++    q04_signals = db.query(func.count(ReviewSignal.id)).filter(ReviewSignal.reason.ilike("TOTAL_MISMATCH:%")).scalar()
+     
+     return {
+         "assessment": {
+diff --git a/backend/api/v1/endpoints/categorise.py b/backend/api/v1/endpoints/categorise.py
+index 5912289..a3570d1 100644
+--- a/backend/api/v1/endpoints/categorise.py
++++ b/backend/api/v1/endpoints/categorise.py
+@@ -1,43 +1,81 @@
+ from fastapi import APIRouter, Depends, HTTPException
+ from sqlalchemy.orm import Session
+ from uuid import UUID
+-import random
+-import json
+ 
+ from core.database import get_db
+ from models import ProcessingJob
++from services.knowledge import get_knowledge_service
+ 
+ router = APIRouter()
+ 
++# TF-IDF cosine similarity against a tiny seeded knowledge base is a weak
++# signal, not a trained classifier -- these thresholds are deliberately
++# conservative rather than tuned to look impressive.
++_HIGH_MATCH_THRESHOLD = 0.5
++_PARTIAL_MATCH_THRESHOLD = 0.2
++
++
++def _extracted_answer_text(job: ProcessingJob) -> str:
++    """Concatenate whatever OCR text is on the job. Empty string if OCR never
++    produced usable text (e.g. OCR libraries missing -> FALLBACK_DETERMINISTIC),
++    so the caller can report that honestly instead of scoring garbage."""
++    if not job.result_data:
++        return ""
++    doc_intel = job.result_data.get("documentIntelligence") or {}
++    if (doc_intel.get("metadata") or {}).get("status") == "FALLBACK_DETERMINISTIC":
++        return ""
++    pages = doc_intel.get("pages") or []
++    return "\n".join((p.get("text") or "") for p in pages).strip()
++
++
+ @router.post("/{doc_id}/categorise")
+ def categorise_assessment(doc_id: UUID, db: Session = Depends(get_db)):
+     """
+-    Phase 7: Real application logic for categorising a specific processed document.
+-    HIGH MATCH, PARTIAL MATCH, LOW MATCH / REVIEW.
++    Real categorisation against the local TF-IDF knowledge base
++    (services/knowledge.py). Previously this endpoint always returned a
++    hardcoded REVIEW REQUIRED / 0.0 confidence regardless of input -- the
++    README's claim that "categorisation uses TF-IDF-based local retrieval"
++    was not actually true, because KnowledgeService was never called from
++    anywhere. This wires it in for real: genuine TF-IDF cosine similarity
++    between the OCR'd answer text and the seeded knowledge base, reported
++    as the (weak) signal that it is. When OCR text itself isn't available,
++    that is still reported honestly rather than scored.
+     """
+     job = db.query(ProcessingJob).filter(ProcessingJob.id == doc_id).first()
+     if not job:
+         raise HTTPException(status_code=404, detail="Processed document not found")
+-        
+-    # Extract actual stats from the OCR ProcessingJob
+-    pages_processed = job.result_data.get("stats", {}).get("pagesProcessed", 0) if job.result_data else 0
+-    
+-    # Semantic model is unavailable locally (PyTorch download failed)
+-    # Return honest state instead of faking semantic categorisation
+-    assigned_category = "REVIEW REQUIRED"
+-    message = "SEMANTIC MODEL UNAVAILABLE"
+-    confidence_val = 0.0
+-    
+-    # Store categorisation in result_data
++
++    answer_text = _extracted_answer_text(job)
++
++    if not answer_text:
++        assigned_category = "REVIEW REQUIRED"
++        message = "No OCR text available to categorise against."
++        confidence_val = 0.0
++        best_match = None
++    else:
++        matches = get_knowledge_service().retrieve(answer_text, top_k=1)
++        best_match = matches[0] if matches else None
++        confidence_val = round(float(best_match["score"]), 4) if best_match else 0.0
++
++        if confidence_val >= _HIGH_MATCH_THRESHOLD:
++            assigned_category = "HIGH MATCH"
++            message = f"Closest local knowledge match: {best_match['id']} (TF-IDF similarity {confidence_val:.2f})"
++        elif confidence_val >= _PARTIAL_MATCH_THRESHOLD:
++            assigned_category = "PARTIAL MATCH"
++            message = f"Weak local knowledge match: {best_match['id']} (TF-IDF similarity {confidence_val:.2f})"
++        else:
++            assigned_category = "REVIEW REQUIRED"
++            message = "No strong match against the local TF-IDF knowledge base; needs human review."
++
+     current_data = job.result_data or {}
+     current_data["category"] = assigned_category
+-    
+-    # Store the actual confidence
+     current_data["category_confidence"] = confidence_val
+-    
++    if best_match:
++        current_data["category_match"] = {"knowledge_id": best_match["id"], "score": confidence_val}
++
+     job.result_data = current_data
+     db.commit()
+-    
++
+     return {
+         "id": doc_id,
+         "category": assigned_category,
+diff --git a/backend/api/v1/endpoints/verification.py b/backend/api/v1/endpoints/verification.py
+index 4aebc5a..f94dea6 100644
+--- a/backend/api/v1/endpoints/verification.py
++++ b/backend/api/v1/endpoints/verification.py
+@@ -1,4 +1,7 @@
+ import re
++import statistics
++import logging
++from datetime import datetime
+ from fastapi import APIRouter, Depends, HTTPException
+ from sqlalchemy.orm import Session
+ from uuid import UUID
+@@ -11,6 +14,7 @@ from services.ml import get_anomaly_detector
+ 
+ router = APIRouter()
+ anomaly_detector = get_anomaly_detector()
++logger = logging.getLogger(__name__)
+ 
+ 
+ def _question_label(question: Question, fallback_index: int) -> str:
+@@ -45,9 +49,20 @@ def verify_evaluation(evaluation_id: UUID, db: Session = Depends(get_db)):
+          Mark with question_id IS NULL), it is compared against the real
+          computed sum of question marks. A mismatch produces a
+          TOTAL_MISMATCH signal with the real numbers.
+-
+-    Any signal persists a real ReviewSignal + ModerationCase and blocks
+-    result readiness until moderation resolves it.
++      3. The anomaly-detection model (services/ml.py) is run against real
++         features derived from the persisted marks -- previously this
++         model was instantiated at module load but never actually called,
++         so it never contributed anything. It can now add an informational
++         ML_ANOMALY signal. If the model is unavailable (e.g. ENV=production
++         without a real model artifact configured), that is logged and
++         skipped rather than crashing the whole verification request.
++
++    Every signal carries a `blocking` flag. Only blocking signals gate the
++    result and open a moderation case -- previously this flag was set on
++    each signal but never actually read anywhere, so ANY signal (including
++    a purely informational one) forced REVIEW_REQUIRED and a moderation
++    case. Non-blocking signals are still persisted as ReviewSignal rows for
++    the analytics/audit trail.
+     """
+     evaluation = db.query(Evaluation).filter(Evaluation.id == evaluation_id).first()
+     if not evaluation:
+@@ -84,7 +99,8 @@ def verify_evaluation(evaluation_id: UUID, db: Session = Depends(get_db)):
+             })
+ 
+     computed_total = sum(marks_by_question.values())
+-    if recorded_total_row is not None and recorded_total_row.score != computed_total:
++    has_total_mismatch = recorded_total_row is not None and recorded_total_row.score != computed_total
++    if has_total_mismatch:
+         signals.append({
+             "type": "TOTAL_MISMATCH",
+             "question": None,
+@@ -92,14 +108,43 @@ def verify_evaluation(evaluation_id: UUID, db: Session = Depends(get_db)):
+             "blocking": True
+         })
+ 
+-    status = "REVIEW_REQUIRED" if signals else "VERIFIED"
++    if marks_by_question:
++        mark_values = list(marks_by_question.values())
++        mark_variance = statistics.pvariance(mark_values) if len(mark_values) > 1 else 0.0
++        elapsed_minutes = (
++            max((datetime.utcnow() - evaluation.created_at).total_seconds() / 60.0, 0.0)
++            if evaluation.created_at else 15.0
++        )
++        anomaly_result = None
++        try:
++            anomaly_result = anomaly_detector.predict({
++                "q04_discrepancy": 1.0 if has_total_mismatch else 0.0,
++                "evaluation_time_mins": elapsed_minutes,
++                "mark_variance": mark_variance,
++            })
++        except Exception as e:
++            logger.warning(f"Anomaly detector unavailable, skipping ML_ANOMALY check for evaluation {evaluation.id}: {e}")
++
++        if anomaly_result and anomaly_result.get("review_required"):
++            signals.append({
++                "type": "ML_ANOMALY",
++                "question": None,
++                "message": (
++                    f"Anomaly model ({anomaly_result['model_version']}) flagged this evaluation "
++                    f"(severity {anomaly_result['severity']}, score {anomaly_result['anomaly_score']:.3f})."
++                ),
++                "blocking": False
++            })
++
++    blocking_signals = [s for s in signals if s.get("blocking")]
++    status = "REVIEW_REQUIRED" if blocking_signals else "VERIFIED"
+     case_id = None
+ 
+-    if signals:
+-        evaluation.status = "REVIEW_REQUIRED"
+-        for sig in signals:
+-            db.add(ReviewSignal(evaluation_id=evaluation.id, reason=f"{sig['type']}: {sig['message']}"))
++    for sig in signals:
++        db.add(ReviewSignal(evaluation_id=evaluation.id, reason=f"{sig['type']}: {sig['message']}"))
+ 
++    if blocking_signals:
++        evaluation.status = "REVIEW_REQUIRED"
+         case = (
+             db.query(ModerationCase)
+             .filter(ModerationCase.evaluation_id == evaluation.id, ModerationCase.status == "OPEN")
+@@ -113,6 +158,15 @@ def verify_evaluation(evaluation_id: UUID, db: Session = Depends(get_db)):
+         case_id = str(case.id)
+     else:
+         evaluation.status = "VERIFIED"
++        # Real elapsed marking time, now that the evaluation is clean.
++        # Previously evaluation_time_mins was only ever set by the legacy
++        # POST /evaluation/ endpoint, which the real session-based golden
++        # path never calls -- so analytics.py's average_evaluation_time_mins
++        # was always 0 for every real evaluation. This gives it real data.
++        if evaluation.created_at:
++            evaluation.evaluation_time_mins = max(
++                int(round((datetime.utcnow() - evaluation.created_at).total_seconds() / 60.0)), 0
++            )
+         db.commit()
+ 
+     return {
+diff --git a/backend/services/knowledge.py b/backend/services/knowledge.py
+index 7a5c171..cb16378 100644
+--- a/backend/services/knowledge.py
++++ b/backend/services/knowledge.py
+@@ -1,6 +1,6 @@
+ import os
+ from abc import ABC, abstractmethod
+-from typing import List, Dict, Any
++from typing import List, Dict, Any, Optional
+ import numpy as np
+ from sklearn.feature_extraction.text import TfidfVectorizer
+ 
+@@ -123,3 +123,19 @@ class KnowledgeService:
+             "embedding": vec,
+             "metadata": metadata or {}
+         })
++
++
++# Process-wide singleton. KnowledgeService.__init__ fits a TfidfVectorizer over
++# the seed corpus, which is wasted work (and, for LocalEmbeddingProvider,
++# actively wrong -- refitting on a fresh instance discards the vocabulary
++# built from previously ingested documents) if a new instance is created on
++# every request. Nothing in the codebase previously called this at all -- see
++# api/v1/endpoints/categorise.py, which now uses it for real.
++_knowledge_service: Optional["KnowledgeService"] = None
++
++
++def get_knowledge_service() -> "KnowledgeService":
++    global _knowledge_service
++    if _knowledge_service is None:
++        _knowledge_service = KnowledgeService()
++    return _knowledge_service
+diff --git a/backend/services/ml.py b/backend/services/ml.py
+index dd921d2..571ab0f 100644
+--- a/backend/services/ml.py
++++ b/backend/services/ml.py
+@@ -76,23 +76,49 @@ class DevelopmentIsolationForestProvider(AnomalyModelProvider):
+         return self._version
+ 
+ class ProductionModelProvider(AnomalyModelProvider):
++    """
++    Placeholder for a real production model (e.g. loaded from S3 or a model
++    registry). Deliberately NOT a silent no-op: previously `predict()` fell
++    through to an implicit `return None` whenever a model file happened to
++    be present, and `score()` did that unconditionally -- callers expecting
++    a dict/float would get None and fail confusingly wherever they tried to
++    use it. Now every path either does the real thing or fails loudly and
++    explains why, so a misconfigured production deployment can't be mistaken
++    for "no anomalies detected".
++    """
+     def __init__(self, model_path="/models/production.joblib"):
+         self.model_path = model_path
+         self.model = None
+-        
++        self.load()
++
+     def load(self):
+-        # In real production, load from S3 or registry
+         if os.path.exists(self.model_path):
+             self.model = joblib.load(self.model_path)
+-            
+-    def predict(self, features: dict) -> dict:
++
++    def _require_model(self):
+         if not self.model:
+-            raise RuntimeError("Production model not loaded.")
+-        pass # Implementation similar to Dev
+-        
++            raise RuntimeError(
++                f"Production anomaly model not found at {self.model_path}. "
++                "ENV=production requires a real model artifact; this "
++                "deliberately does not fall back to the development model, "
++                "so a missing model is never silently mistaken for "
++                "'no anomaly'."
++            )
++
++    def predict(self, features: dict) -> dict:
++        self._require_model()
++        raise NotImplementedError(
++            "ProductionModelProvider.predict() is not implemented yet -- "
++            "wire up the real production model's inference call here."
++        )
++
+     def score(self, features: dict) -> float:
+-        pass
+-        
++        self._require_model()
++        raise NotImplementedError(
++            "ProductionModelProvider.score() is not implemented yet -- "
++            "wire up the real production model's inference call here."
++        )
++
+     def version(self) -> str:
+         return "prod-v1"
+ 

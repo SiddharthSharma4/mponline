@@ -1,6 +1,6 @@
 import os
 from abc import ABC, abstractmethod
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -123,3 +123,19 @@ class KnowledgeService:
             "embedding": vec,
             "metadata": metadata or {}
         })
+
+
+# Process-wide singleton. KnowledgeService.__init__ fits a TfidfVectorizer over
+# the seed corpus, which is wasted work (and, for LocalEmbeddingProvider,
+# actively wrong -- refitting on a fresh instance discards the vocabulary
+# built from previously ingested documents) if a new instance is created on
+# every request. Nothing in the codebase previously called this at all -- see
+# api/v1/endpoints/categorise.py, which now uses it for real.
+_knowledge_service: Optional["KnowledgeService"] = None
+
+
+def get_knowledge_service() -> "KnowledgeService":
+    global _knowledge_service
+    if _knowledge_service is None:
+        _knowledge_service = KnowledgeService()
+    return _knowledge_service

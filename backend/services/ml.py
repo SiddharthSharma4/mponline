@@ -76,23 +76,49 @@ class DevelopmentIsolationForestProvider(AnomalyModelProvider):
         return self._version
 
 class ProductionModelProvider(AnomalyModelProvider):
+    """
+    Placeholder for a real production model (e.g. loaded from S3 or a model
+    registry). Deliberately NOT a silent no-op: previously `predict()` fell
+    through to an implicit `return None` whenever a model file happened to
+    be present, and `score()` did that unconditionally -- callers expecting
+    a dict/float would get None and fail confusingly wherever they tried to
+    use it. Now every path either does the real thing or fails loudly and
+    explains why, so a misconfigured production deployment can't be mistaken
+    for "no anomalies detected".
+    """
     def __init__(self, model_path="/models/production.joblib"):
         self.model_path = model_path
         self.model = None
-        
+        self.load()
+
     def load(self):
-        # In real production, load from S3 or registry
         if os.path.exists(self.model_path):
             self.model = joblib.load(self.model_path)
-            
-    def predict(self, features: dict) -> dict:
+
+    def _require_model(self):
         if not self.model:
-            raise RuntimeError("Production model not loaded.")
-        pass # Implementation similar to Dev
-        
+            raise RuntimeError(
+                f"Production anomaly model not found at {self.model_path}. "
+                "ENV=production requires a real model artifact; this "
+                "deliberately does not fall back to the development model, "
+                "so a missing model is never silently mistaken for "
+                "'no anomaly'."
+            )
+
+    def predict(self, features: dict) -> dict:
+        self._require_model()
+        raise NotImplementedError(
+            "ProductionModelProvider.predict() is not implemented yet -- "
+            "wire up the real production model's inference call here."
+        )
+
     def score(self, features: dict) -> float:
-        pass
-        
+        self._require_model()
+        raise NotImplementedError(
+            "ProductionModelProvider.score() is not implemented yet -- "
+            "wire up the real production model's inference call here."
+        )
+
     def version(self) -> str:
         return "prod-v1"
 
