@@ -1,0 +1,9 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.env
+backend/model_dev.joblib
+
+/data/
+.lite-venv/
